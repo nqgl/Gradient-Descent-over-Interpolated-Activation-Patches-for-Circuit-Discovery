@@ -1,0 +1,6 @@
+transformer-lens
+torch
+jaxtyping
+einops
+pytest
+plotly
