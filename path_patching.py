@@ -479,33 +479,33 @@ def get_per_layer_patch_coefficients(model: HookedTransformer):
     return patch_coefficients, roots
 
 
-def clean_dirty_resid_pre(
-    resid_head_dirty_coeffs : Union[
-        Float[Tensor, "head_index"],
-        Float[Tensor, "pos head_index"] # in this this mode you can see which heads need to read from where!
-    ],
-    clean_cache: ActivationCache,
-    dirty_cache: ActivationCache,
-    parallelism = 1
-):
-    if parallelism == 1:
-        return clean_cache["resid_pre", 0].lerp(
-            dirty_cache["resid_pre", 0], 
-            resid_head_dirty_coeffs.unsqueeze(-1)
-        )
-    else:
-        batch_size = clean_cache["resid_pre", 0].shape[0]
-        segment_size = batch_size // parallelism
-        assert batch_size % parallelism == 0
-        outs = []
-        for i in range(parallelism):
-            out = clean_cache["resid_pre", 0].lerp(
-                dirty_cache["resid_pre", 0][i * segment_size : (i + 1) * segment_size], 
-                resid_head_dirty_coeffs[i].unsqueeze(-1)
-            )
-            outs.append(out)
-        out = torch.cat(outs, dim=0)
-        return out
+# def clean_dirty_resid_pre(
+#     resid_head_dirty_coeffs : Union[
+#         Float[Tensor, "head_index"],
+#         Float[Tensor, "pos head_index"] # in this this mode you can see which heads need to read from where!
+#     ],
+#     clean_cache: ActivationCache,
+#     dirty_cache: ActivationCache,
+#     parallelism = 1
+# ):
+#     if parallelism == 1:
+#         return clean_cache["resid_pre", 0].lerp(
+#             dirty_cache["resid_pre", 0], 
+#             resid_head_dirty_coeffs.unsqueeze(-1)
+#         )
+#     else:
+#         batch_size = clean_cache["resid_pre", 0].shape[0]
+#         segment_size = batch_size // parallelism
+#         assert batch_size % parallelism == 0
+#         outs = []
+#         for i in range(parallelism):
+#             out = clean_cache["resid_pre", 0].lerp(
+#                 dirty_cache["resid_pre", 0][i * segment_size : (i + 1) * segment_size], 
+#                 resid_head_dirty_coeffs[i].unsqueeze(-1)
+#             )
+#             outs.append(out)
+#         out = torch.cat(outs, dim=0)
+#         return out
 
 def extract_tensor_hook(
     heads_output :Float[Tensor, "batch pos head_index d_head"],
@@ -578,7 +578,7 @@ def interpolated_path_patch(
     # new_dataset: IOIDataset = abc_dataset,
     # orig_dataset: IOIDataset = ioi_dataset,
     coeffs : InterpolatedPathPatch,
-    patch_coefficients : Optional[List[Float[Tensor, "... head_index"]]] = None,
+    # patch_coefficients : Optional[List[Float[Tensor, "... head_index"]]] = None,
     new_cache: Optional[ActivationCache] = abc_cache,
     orig_cache: Optional[ActivationCache] = ioi_cache,
     parallelism = 1
@@ -588,15 +588,14 @@ def interpolated_path_patch(
     seq_len = new_cache["z", 0].shape[1]
     batch_size = new_cache["z", 0].shape[0]
 
-    if patch_coefficients is None:
-        patch_coefficients = get_patch_coefficients()
-    patched_heads_values = [
-        orig_cache["z", 0].lerp(
-            new_cache["z", 0], patch_coefficients[0].unsqueeze(-1)
-        )
-    ]
-    orig_cache["resid_pre", 0].shape
-    orig_resid_pre = parallelize(orig_cache["resid_pre", 0], parallelism)
+
+    patch_coefficients = coeffs.c_layers()
+    patched_heads_values = []
+        # orig_cache["z", 0].lerp(
+        #     new_cache["z", 0], patch_coefficients[0].unsqueeze(-1)
+        # )
+    # orig_cache["resid_pre", 0].shape
+    # orig_resid_pre = parallelize(orig_cache["resid_pre", 0], parallelism)
     # einops.repeat(
     #     orig_cache["resid_pre", 0],
     #     "batch ... -> (parallelism batch) ...",
@@ -613,17 +612,19 @@ def interpolated_path_patch(
 
     # print(orig_cache["resid_pre", 0].shape)
     # print(orig_resid_pre.shape)
-    for layer in range(1, model.cfg.n_layers):
+    for layer in range(0, model.cfg.n_layers):
         patched_heads_in_layer = []
         print("\nlayer", layer, end="->")
         for head_i in range(model.cfg.n_heads // parallelism):  
             head = head_i * parallelism
             print(head, end=", ")
-            print("\n patch_shape[layer]", patch_coefficients[layer].shape)
-            if parallelism == 1:
-                head_coeffs = patch_coefficients[layer][head]
+            if layer != 0:
+                if parallelism == 1:
+                    head_coeffs = patch_coefficients[layer][head]
+                else:
+                    head_coeffs = patch_coefficients[layer][head : head + parallelism]
             else:
-                head_coeffs = patch_coefficients[layer][head : head + parallelism]
+                head_coeffs = None
             hook_fn = partial(
                 head_interpolate_hook,
                 clean_cache=orig_cache,
@@ -641,7 +642,13 @@ def interpolated_path_patch(
                 parallelism = parallelism
             )
             logits = model.run_with_hooks(
-                orig_resid_pre,
+                coeffs.interpolate_resid_pres(
+                    orig_cache["resid_pre", 0],
+                    new_cache["resid_pre", 0],
+                    layer=layer,
+                    parallelism=parallelism,
+                    start_head=head if parallelism != model.cfg.n_heads else None
+                ),
                 start_at_layer=0,
                 stop_at_layer=layer + 1,
                 fwd_hooks=[
@@ -656,7 +663,7 @@ def interpolated_path_patch(
             )
         zcat = torch.cat(patched_heads_in_layer, dim=-2)
         patched_heads_values += [zcat]
-    last_patch_coeffs = patch_coefficients[-1]
+    last_patch_coeffs = coeffs.c_out()
     hook_fn = partial(
         head_interpolate_hook,
         clean_cache=orig_cache,
@@ -700,40 +707,43 @@ def interpolated_path_patch(
 
 patcher = InterpolatedPathPatch(model)
 # patch_coefficients = [patcher.pre] + [*patcher.layers[1:]] + [patcher.post]
-optim = torch.optim.Adam(patcher.parameters(), lr=0.1, weight_decay=0, betas=(0.9, 0.99))
+optim = torch.optim.Adam(patcher.parameters(), lr=0.1, weight_decay=0, betas=(0.84, 0.97))
+# optim = torch.optim.SGD(patcher.parameters(), lr=0.05, momentum=0.9)
+
 # patch_coefficients, roots = get_per_layer_patch_coefficients(model)
 # optim = torch.optim.Adam(roots, lr=0.1, weight_decay=0.01)
 # optim = torch.optim.Adam(roots, lr=0.1, weight_decay=0, betas=(0.9, 0.94))
 # clamped_coefficients = patcher.clamplist()
-patch_coefficients = [patcher.pre] + [*patcher.layers[1:]] + [patcher.post]
-clamped_coefficients = gradthruclamplist(patch_coefficients)
+# patch_coefficients = [patcher.pre] + [*patcher.layers[1:]] + [patcher.post]
+# clamped_coefficients = gradthruclamplist(patch_coefficients)
 
 
-for i in range(100):
+for i in range(10000):
     print("step ", i)
     optim.zero_grad()
     values, coefficients, logits = interpolated_path_patch(
         model, 
         coeffs=patcher,
-        patch_coefficients=clamped_coefficients,
         parallelism=12
     )
     # patch_coefficients = patcher.tolist()
-    loss_l1 = 1 / 3 * (
-        0.011   * sum([(c.sum() + torch.relu(c).sum()) * 0.5 for c in patch_coefficients])
-        - 0.001 * sum([(c.sum() + torch.relu(c).sum()) * 0.5 for c in patch_coefficients[1:-1]])
-    )
+    loss_l1 = patcher.l1(0.005, 0.07, 0.07)
     loss_logits = ioi_metric(logits)
-    loss = loss_logits + loss_l1
-    l0 = sum([torch.count_nonzero(c) for c in clamped_coefficients])
-    if l0 < 100:
+    l0 = patcher.l0()
+    loss = loss_logits + loss_l1 * (0.95 + l0 / 10000) if i > 2 else loss_logits + loss_l1
+
+    if l0 < 400:
+        patcher.print_connections(threshold=0)
+
         patcher.print_connections()
-    print("losses:", loss_logits.item(), loss_l1.item())
+    print("\nlogit diff:", loss_logits.item())
+    print("L1:", loss_l1.item())
     print("nonzero coeffs:", l0)
     loss.backward()
     optim.step()
+    # if i == 10:
+    #     patcher.clamp_params()
     # clamped_coefficients = patcher.clamplist()
-    clamped_coefficients = gradthruclamplist(patch_coefficients)
 
 
 

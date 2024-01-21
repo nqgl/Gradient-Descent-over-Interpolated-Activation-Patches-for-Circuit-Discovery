@@ -16,8 +16,8 @@ model = HookedTransformer.from_pretrained(
     fold_ln=True,
     refactor_factored_attn_matrices=True,
 )
-
-N = 1
+# model = torch.compile(model)
+N = 8
 ioi_dataset = IOIDataset(
     prompt_type="mixed",
     N=N,
