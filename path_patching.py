@@ -17,7 +17,7 @@ import torch.nn.functional as F
 # device = t.device("cuda") if t.cuda.is_available() else t.device("cpu")
 
 # %%
-from parameters import InterpolatedPathPatch
+from parameters import InterpolatedPathPatch, parallelize
 # %%
 
 from load_run import model, ioi_dataset, abc_dataset, ioi_cache, abc_cache, ioi_metric
@@ -478,12 +478,6 @@ def get_per_layer_patch_coefficients(model: HookedTransformer):
 
     return patch_coefficients, roots
 
-def parallelize(btensor, parallelism):
-    return einops.repeat(
-        btensor,
-        "batch ... -> (parallelism batch) ...",
-        parallelism=parallelism
-    )
 
 def clean_dirty_resid_pre(
     resid_head_dirty_coeffs : Union[
@@ -601,11 +595,13 @@ def interpolated_path_patch(
             new_cache["z", 0], patch_coefficients[0].unsqueeze(-1)
         )
     ]
-    orig_resid_pre = einops.repeat(
-        orig_cache["resid_pre", 0],
-        "batch ... -> (parallelism batch) ...",
-        parallelism=parallelism
-    )
+    orig_cache["resid_pre", 0].shape
+    orig_resid_pre = parallelize(orig_cache["resid_pre", 0], parallelism)
+    # einops.repeat(
+    #     orig_cache["resid_pre", 0],
+    #     "batch ... -> (parallelism batch) ...",
+    #     parallelism=parallelism
+    # )
     # if parallelism != 1:
     #     _, orig_cache = model.run_with_cache(
     #         orig_resid_pre,
@@ -708,7 +704,11 @@ optim = torch.optim.Adam(patcher.parameters(), lr=0.1, weight_decay=0, betas=(0.
 # patch_coefficients, roots = get_per_layer_patch_coefficients(model)
 # optim = torch.optim.Adam(roots, lr=0.1, weight_decay=0.01)
 # optim = torch.optim.Adam(roots, lr=0.1, weight_decay=0, betas=(0.9, 0.94))
-clamped_coefficients = patcher.clamplist()
+# clamped_coefficients = patcher.clamplist()
+patch_coefficients = [patcher.pre] + [*patcher.layers[1:]] + [patcher.post]
+clamped_coefficients = gradthruclamplist(patch_coefficients)
+
+
 for i in range(100):
     print("step ", i)
     optim.zero_grad()
@@ -716,10 +716,10 @@ for i in range(100):
         model, 
         coeffs=patcher,
         patch_coefficients=clamped_coefficients,
-        parallelism=1
+        parallelism=12
     )
-    patch_coefficients = patcher.tolist()
-    loss_l1 = 2 / 3 * (
+    # patch_coefficients = patcher.tolist()
+    loss_l1 = 1 / 3 * (
         0.011   * sum([(c.sum() + torch.relu(c).sum()) * 0.5 for c in patch_coefficients])
         - 0.001 * sum([(c.sum() + torch.relu(c).sum()) * 0.5 for c in patch_coefficients[1:-1]])
     )
@@ -732,7 +732,8 @@ for i in range(100):
     print("nonzero coeffs:", l0)
     loss.backward()
     optim.step()
-    clamped_coefficients = patcher.clamplist()
+    # clamped_coefficients = patcher.clamplist()
+    clamped_coefficients = gradthruclamplist(patch_coefficients)
 
 
 
