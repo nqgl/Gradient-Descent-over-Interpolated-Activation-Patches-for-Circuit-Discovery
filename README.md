@@ -9,6 +9,9 @@ $$
 O\left(
   h \sum\limits_{l=0}^{n - 1} l h 
 \right)
+=O\left(
+n^2 h^2 
+\right)
 $$
 
 $$
