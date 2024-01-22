@@ -4,8 +4,9 @@ for gpt-2-small there are
 $$h \sum\limits_{l=0}^{n - 1} l h = n (n - 1) / 2 * h ^ 2 = 9504$$
 
 or
+
 $$
-\big O \left(
+\big{O} \left(
   h \sum\limits_{l=0}^{n - 1} l h 
 \right)
 $$
