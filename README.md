@@ -44,13 +44,13 @@ n^2 h^2
 $$
 
 
-The naive implementation of this requires O(n^2 h^2) forward passes if I recall correctly. However you can do parallel src-heads within the same layer together by stacking them into a batch dimension, which brings it down to O(n^2 h) forward passes. This is pretty absurd and implausibly workable. Nevertheless, it's what I wanted to work on. 
+The naive implementation of this requires O(n^2 h^2) forward passes if I recall correctly. However you can do parallel src-heads within the same layer together by stacking them into a batch dimension, which brings it down to O(n^2 h) forward passes. This is pretty absurd but has been nagging at me to give it a try for a while. 
 
-My plan was to start by implementing this mostly to clarify some things for myself, then have it require an utterly unworkable amount of vram, after which I would start by pairing the graph first eg learn ((head,layer)->(layer)) connections prior to doing edge-level processing on the subgraph produced by that process. I still think this is a good idea, as running a single iteration takes 10-30 seconds and at a batch size of 8 it uses ~15gb of VRAM
+My plan was to start by implementing this just to clarify some things for myself, then have it require an utterly unworkable amount of vram, after which I would start by modifying the technique to first prune the graph by learn ((head,layer)->(layer)) edges prior to doing full edge processing on the subgraph produced by that process. However, it's actually just fully runnable currently! I still think these improvements would be a good idea, as running a single iteration takes 10-30 seconds and at a batch size of 8 it uses ~15gb of VRAM. It's very slow. As one would expect for something that requires O(n^2 h^2) forward passes of gpt2 per optimization step...
 
-Nevertheless, it works a little bit? and manages to fit in vram! Not fast at all though.
+Nevertheless, it works somewhat at finding IOI edges! and manages to fit in vram! Not fast at all though.
 
-It recovers some of the IOI circuit and some false positives, I haven't gotten to hyperparameter tune it enough to fully assess if this is capable of doing a decent job discovering circuits
+It recovers some of the IOI circuit and some false positives, I haven't gotten to hyperparameter tune it enough to fully assess if this is capable of doing a decent job discovering circuits. Current performance is not competitive.
 
 
 
