@@ -1,7 +1,7 @@
 # Gradient-Descent-over-Interpolated-Activation-Patches-for-Circuit-Discovery
 
 for gpt-2-small there are 
-$$\sum{l=0}{n - 1} l h ^ 2 = n (n + 1) / 2 * h ^ 2$$
+$$\sum\limits_{l=0}^{n - 1} l h ^ 2 = n (n + 1) / 2 * h ^ 2$$
 
 $$
 \sum
