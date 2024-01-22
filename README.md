@@ -1,4 +1,5 @@
-# Gradient-Descent-over-Interpolated-Activation-Patches-for-Circuit-Discovery
+# Gradient Descent Over Interpolated Activation Patches for Circuit Discovery
+### Glen Taggart
 
 for gpt-2-small there are 
 $h \sum\limits_{l=0}^{n - 1} l h = n (n - 1) / 2 * h ^ 2 = 9504$
