@@ -1,5 +1,3 @@
-% Gradient Descent Over Interpolated Activation Patches for Circuit Discovery
-% Glen M. Taggart
 ---
 header-includes:
   - \usepackage[ruled,vlined,linesnumbered]{algorithm2e}
