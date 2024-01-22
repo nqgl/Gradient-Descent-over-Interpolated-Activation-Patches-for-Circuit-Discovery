@@ -47,3 +47,7 @@ The naive implementation of this requires O(n^2 h^2) forward passes if I recall 
 My plan was to start by implementing this mostly to clarify some things for myself, then have it require an utterly unworkable amount of vram, after which I would start by pairing down the graph prior to doing edge-level processing. I still think this is a good idea, as running a single iteration takes 10-30 seconds and at a batch size of 8 it uses ~15gb of VRAM
 
 Nevertheless, it works a little bit? On not very many iterations so I have to turn way up the  
+
+
+
+
