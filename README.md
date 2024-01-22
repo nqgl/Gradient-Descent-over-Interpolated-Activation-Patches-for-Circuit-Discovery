@@ -6,6 +6,7 @@ $h \sum\limits_{l=0}^{n - 1} l h = n (n - 1) / 2 * h ^ 2 = 9504$
 
 The psuedocode (glossing over the output coefficients and residual input coefficient) for what is calculated is like:
 activations from normal vs corrupted run: 
+```
 W : edge weights
 forward : normal model forward to get cached values for heads
 forward_patched : a patched forward pass with $head_l_h$ values inside the curly braces patched into head $h$ of layer $l$ and values in brackets corresponding to the value of the head to extract
@@ -25,7 +26,7 @@ out = forward_patched(input){
     for h $\in {0, 1, 2, ..., 12}:
       head_l_h = patched_l_h
 }
-
+```
 $$
 O\left(
   h \sum\limits_{l=0}^{n - 1} l h 
