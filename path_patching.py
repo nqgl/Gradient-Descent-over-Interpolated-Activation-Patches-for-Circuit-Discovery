@@ -17,19 +17,10 @@ import torch.nn.functional as F
 # device = t.device("cuda") if t.cuda.is_available() else t.device("cpu")
 
 # %%
-from parameters import InterpolatedPathPatch, parallelize
+from parameters import InterpolatedPathPatch, parallelize, mylerp
 # %%
 
-from load_run import model, ioi_dataset, abc_dataset, ioi_cache, abc_cache, ioi_metric
-
-# class PathPatchExperiment:
-#     def  __init__(self, model, ioi_dataset, abc_dataset):
-#         self.model = model
-#         self.ioi_dataset = ioi_dataset
-#         self.abc_dataset = abc_dataset
-#         self.ioi_cache = None
-#         self.abc_cache = None
-#         self.ioi_metric = None
+from load_run import model, get_next_data
 
 
 
@@ -86,8 +77,8 @@ def get_path_patch_heads(
     model: HookedTransformer,
     patching_metric: Callable,
     paths : Tuple[Tuple[int, int], Tuple[int, int]],
-    new_cache: Optional[ActivationCache] = abc_cache,
-    orig_cache: Optional[ActivationCache] = ioi_cache,
+    new_cache: Optional[ActivationCache] ,
+    orig_cache: Optional[ActivationCache] ,
     
 ) -> Float[Tensor, "layer head"]:
 
@@ -232,10 +223,8 @@ def get_path_patch_heads_multidest(
     patching_metric: Callable,
     src_nodes : List[Tuple[int, int]],
     dest_nodes : List[Tuple[int, int]],
-    new_dataset: IOIDataset = abc_dataset,
-    orig_dataset: IOIDataset = ioi_dataset,
-    new_cache: Optional[ActivationCache] = abc_cache,
-    orig_cache: Optional[ActivationCache] = ioi_cache,
+    new_cache: Optional[ActivationCache] ,
+    orig_cache: Optional[ActivationCache],
 ) -> Float[Tensor, "layer head"]:
 
     #step 2
@@ -337,11 +326,9 @@ def get_path_patch_heads_multidest(
     patching_metric: Callable,
     src_nodes : List[Tuple[int, int]],
     dest_nodes : List[Tuple[int, int]],
-    new_dataset: IOIDataset = abc_dataset,
-    orig_dataset: IOIDataset = ioi_dataset,
-    new_cache: Optional[ActivationCache] = abc_cache,
-    orig_cache: Optional[ActivationCache] = ioi_cache,
-) -> Float[Tensor, "layer head"]:
+    new_cache: Optional[ActivationCache],
+    orig_cache: Optional[ActivationCache]
+    ) -> Float[Tensor, "layer head"]:
 
     #step 2
     seq_len = new_cache["z", 0].shape[1]
@@ -549,7 +536,8 @@ def head_interpolate_hook(
     #     patch_coefficients[hook.layer()].unsqueeze(-1)
     # )
     if parallelism == 1:
-        out = clean_cache[hook.name].lerp(
+        out = mylerp(
+            clean_cache[hook.name],
             patched_heads[hook.layer()], 
             patch_coefficients[hook.layer()].unsqueeze(-1)
         )
@@ -561,7 +549,8 @@ def head_interpolate_hook(
         assert batch_size % parallelism == 0
         outs = []
         for i in range(parallelism):
-            out = clean_cache[hook.name].lerp(
+            out = mylerp(
+                clean_cache[hook.name],
                 patched_heads[hook.layer()], 
                 patch_coefficients[i][hook.layer()].unsqueeze(-1)
             )
@@ -579,8 +568,8 @@ def interpolated_path_patch(
     # orig_dataset: IOIDataset = ioi_dataset,
     coeffs : InterpolatedPathPatch,
     # patch_coefficients : Optional[List[Float[Tensor, "... head_index"]]] = None,
-    new_cache: Optional[ActivationCache] = abc_cache,
-    orig_cache: Optional[ActivationCache] = ioi_cache,
+    new_cache: Optional[ActivationCache],
+    orig_cache: Optional[ActivationCache],
     parallelism = 1
 ) -> Float[Tensor, "layer head"]:
 
@@ -614,10 +603,10 @@ def interpolated_path_patch(
     # print(orig_resid_pre.shape)
     for layer in range(0, model.cfg.n_layers):
         patched_heads_in_layer = []
-        print("\nlayer", layer, end="->")
+        # print("\nlayer", layer, end="->")
         for head_i in range(model.cfg.n_heads // parallelism):  
             head = head_i * parallelism
-            print(head, end=", ")
+            # print(head, end=", ")
             if layer != 0:
                 if parallelism == 1:
                     head_coeffs = patch_coefficients[layer][head]
@@ -705,45 +694,82 @@ def interpolated_path_patch(
     return patched_heads_values, patch_coefficients, logits
 
 
-patcher = InterpolatedPathPatch(model)
 # patch_coefficients = [patcher.pre] + [*patcher.layers[1:]] + [patcher.post]
-optim = torch.optim.Adam(patcher.parameters(), lr=0.1, weight_decay=0, betas=(0.84, 0.97))
-# optim = torch.optim.SGD(patcher.parameters(), lr=0.05, momentum=0.9)
+# optim = torch.optim.Adam(patcher.parameters(), lr=0.1, weight_decay=0, betas=(0.9, 0.98))
 
 # patch_coefficients, roots = get_per_layer_patch_coefficients(model)
-# optim = torch.optim.Adam(roots, lr=0.1, weight_decay=0.01)
+# optim = torch.optim.Adam(roots, lr=0.1, wight_decay=0.01)
 # optim = torch.optim.Adam(roots, lr=0.1, weight_decay=0, betas=(0.9, 0.94))
 # clamped_coefficients = patcher.clamplist()
 # patch_coefficients = [patcher.pre] + [*patcher.layers[1:]] + [patcher.post]
 # clamped_coefficients = gradthruclamplist(patch_coefficients)
+import glob
+import os
+versions = glob.glob("saved_models/version_*")
+versions = [int(v.split("_")[-1]) for v in versions]
+if len(versions) == 0:
+    version = 0
+else:
+    version = max(versions) + 1
 
-
+LOAD=False
+if LOAD:
+    version = InterpolatedPathPatch.get_latest_version()
+    patcher = InterpolatedPathPatch.load_by_version(version, model)
+else:
+    patcher = InterpolatedPathPatch(model)
+optim = torch.optim.Adam(patcher.parameters(), lr=1, betas=(0.9, 0.98))
+N = 1
 for i in range(10000):
     print("step ", i)
     optim.zero_grad()
+    print("getting data")
+    ioi_cache, abc_cache, ioi_metric, kl_metric = get_next_data(N)
+    print("getting path patch")
     values, coefficients, logits = interpolated_path_patch(
         model, 
         coeffs=patcher,
-        parallelism=12
+        new_cache=abc_cache,
+        orig_cache=ioi_cache,
+        parallelism=12,
     )
+    print("done")
     # patch_coefficients = patcher.tolist()
-    loss_l1 = patcher.l1(0.005, 0.07, 0.07)
+
+    kl_div = kl_metric(logits)
+    loss_l1 = patcher.l1(0.1, 0.04, 0.05) / 6
     loss_logits = ioi_metric(logits)
-    l0 = patcher.l0()
-    loss = loss_logits + loss_l1 * (0.95 + l0 / 10000) if i > 2 else loss_logits + loss_l1
+    l0 = patcher.l0().detach()
+    loss = kl_div * 0.02 + loss_logits
+    loss = loss_logits
+    loss = loss + loss_l1 * (1 + l0 / max(10000 - i * 500, 200)) # if i > 20 else loss_logits + loss_l1
 
     if l0 < 400:
         patcher.print_connections(threshold=0)
-
         patcher.print_connections()
-    print("\nlogit diff:", loss_logits.item())
-    print("L1:", loss_l1.item())
-    print("nonzero coeffs:", l0)
+    
+
     loss.backward()
     optim.step()
+    patcher.print_tp_fp()
+    print("\nlogit diff:", loss_logits.item())
+    print("kl_score", kl_div.item())
+    print("L1:", loss_l1.item())
+    print("nonzero coeffs:", l0)
+    print("intermeidate values:", patcher.num_intermediate())
+    if i < 2000 and i % 100 == 0:
+        patcher.clamp_params()
+    if i < 2000 and i % 100 == 50:
+        patcher.clamp_params()
+        patcher.reset_RS_coeffs(0.9, p=0.5, out=True)
+        patcher.reset_edges(0.1, p=0.25)
     # if i == 10:
     #     patcher.clamp_params()
     # clamped_coefficients = patcher.clamplist()
+    if i % 20 == 0:
+        patcher.save(version = version, i = i)
+
+
 
 
 

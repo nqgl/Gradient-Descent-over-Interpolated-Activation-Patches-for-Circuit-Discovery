@@ -6,6 +6,9 @@ import torch.nn.functional as F
 from jaxtyping import Float, Int, Bool
 from torch import Tensor
 import einops
+import fp_vs_fn
+import glob
+import os
 
 
 def parallelize(btensor, parallelism):
@@ -35,7 +38,43 @@ class GradThruRelu(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         return grad_output
+
+class DropIn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, p, v):
+        mask = torch.rand_like(x) > p
+        ctx.save_for_backward(mask)
+        return x * mask + v * (~mask)
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None, None
+        mask, = ctx.saved_tensors
+        return grad_output * mask, None, None
     
+class DropInRand(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, p):
+        mask = torch.rand_like(x) > p
+        v = torch.rand_like(x)
+        ctx.save_for_backward(mask)
+        return x * mask + v * (~mask)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None, None
+        mask, = ctx.saved_tensors
+        return grad_output * mask, None, None
+
+
+class GradThruRelu(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return F.relu(x)
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
 gradthrurelu = GradThruRelu.apply
 
 def gradthrurelu(x):
@@ -43,8 +82,11 @@ def gradthrurelu(x):
 
 
 notzero = 0
-def gradthruclamp(x):
-    return 1 - gradthrurelu(1 - gradthrurelu(x) - notzero)
+def gradthruclamp(x, notzero=notzero):
+    x = 1 - gradthrurelu(1 - gradthrurelu(x) - notzero * 2) - notzero
+    return x
+    return NormGrad.apply(btclamp(x))
+    # return F.sigmoid(x)
 
 
 
@@ -69,15 +111,21 @@ class nonmember_module():
     
 
 class InterpolatedPathPatch(nn.Module):
-    def __init__(self, model, resid_coeff_seq :Optional[int] = None) -> None:
+    def __init__(
+        self, 
+        model, 
+        resid_coeff_seq :Optional[int] = None,
+        p_dropin = 0.15,
+        p_dropout = 0.06,
+    ) -> None:
         super().__init__()
-        rescale = 0.5
+        rescale = 0.75
         bias = 0.25
-        self.model :HookedTransformer = nonmember_module(model)
+        self.modelcfg = model.cfg
         # self.pre = nn.Parameter(
         #     torch.ones(
-        #         model.cfg.n_heads,
-        #         device=model.cfg.device,
+        #         modelcfg.n_heads,
+        #         device=modelcfg.device,
         #         requires_grad=True
         #     ) * rescale
         # )
@@ -86,44 +134,47 @@ class InterpolatedPathPatch(nn.Module):
                 nn.Parameter(
                     torch.rand(
                         (
-                            model.cfg.n_heads,
+                            self.modelcfg.n_heads,
                             layer,
-                            model.cfg.n_heads
+                            self.modelcfg.n_heads
                         ),
-                        device=model.cfg.device,
+                        device=self.modelcfg.device,
                         requires_grad=True
                     ) * rescale + bias
                 )
-                for layer in range(0, model.cfg.n_layers)
+                for layer in range(0, self.modelcfg.n_layers)
             ]
         )
         self.post = nn.Parameter(
-            torch.rand(
+            torch.ones(
                 (
-                    model.cfg.n_heads,
-                    model.cfg.n_heads
+                    self.modelcfg.n_heads,
+                    self.modelcfg.n_heads
                 ),
-                device=model.cfg.device,
+                device=self.modelcfg.device,
                 requires_grad=True
-            ) * rescale + bias
+            ) 
         )
         self.resid_coeffs = nn.Parameter(
-            torch.rand(
+            torch.ones(
                 (
-                    model.cfg.n_layers,
-                    model.cfg.n_heads
+                    self.modelcfg.n_layers,
+                    self.modelcfg.n_heads
                 ) if resid_coeff_seq is None else (
-                    model.cfg.n_layers,
+                    self.modelcfg.n_layers,
                     resid_coeff_seq,
-                    model.cfg.n_heads
+                    self.modelcfg.n_heads
                 ),
-                device=model.cfg.device,
+                device=self.modelcfg.device,
                 requires_grad=True
-            ) * rescale + bias
+            )
         )
-        self.drop = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(0.04)
+        self.dropin_params = (p_dropin, 0.5)
 
 
+    def drop(self, x):
+        return self.dropout(DropIn.apply(x, *self.dropin_params)) * (1 - self.dropout.p) 
 
     def interpolate_resid_pres(
         self, 
@@ -134,51 +185,45 @@ class InterpolatedPathPatch(nn.Module):
         start_head :Optional[int] = None
     ) -> Float[Tensor, "parallelism*batch pos d_model"]:
         batch_size = rsp_clean.shape[0]
-        coefficients = self.resid_coeffs[layer] if layer is not None else self.resid_coeffs
+        coefficients = self.c_RS()[layer] if layer is not None else self.c_RS()
         coefficients = gradthruclamp(self.drop(coefficients))
-        print(start_head, parallelism, rsp_clean.shape, rsp_dirty.shape, coefficients.shape)
+        # print(start_head, parallelism, rsp_clean.shape, rsp_dirty.shape, coefficients.shape)
         if start_head is not None:
             sl = slice(start_head, parallelism + start_head)
         else:
             sl = slice(None)
-        return parallelize(rsp_clean, parallelism).lerp(
+        return mylerp(
+            parallelize(rsp_clean, parallelism),
             parallelize(rsp_dirty, parallelism),
             batchify(coefficients[sl], batch_size).unsqueeze(-1).unsqueeze(-1)
         )
 
+    # @torch.no_grad()
+    # def reset_RS_coeffs(self, new :float = 1.0):
+    #     self.resid_coeffs.data.fill_(new)
+    
+    @torch.no_grad()
+    def reset_RS_coeffs(self, new :Optional[float] = 1.0, p :float = 0.5, out=False):
+        rand = torch.rand_like(self.resid_coeffs.data)
+        self.resid_coeffs.data[
+            (rand < p) & (self.resid_coeffs.data < 0)
+        ] = new if new is not None else torch.rand_like(self.resid_coeffs.data[rand < p])
+        if out:
+            rand = torch.rand_like(self.post.data)
+            self.post.data[
+                (rand < p) & (self.post.data < 0)
+            ] = new if new is not None else torch.rand_like(self.post.data[rand < p])
 
 
-    def print_connections(self, threshold = 0.5):
-        # for layer in range(self.model.cfg.n_layers):
-        #     print("\nRS -> ", end="")        
-        #     for head in range(self.model.cfg.n_heads):
-        #         if self.resid_coeffs[layer][head] > threshold:
-        #             print(f"{layer}.{head}, ", end="")
-        print(f"\n--------\tthresh={threshold}")
-        print()
-        for layer in range(self.model.cfg.n_layers):
-            for head in range(self.model.cfg.n_heads):
-                if torch.any(self.layers[layer][head] > threshold):
-                    print(f"{layer}.{head} <- ", end="")
-                    if self.resid_coeffs[layer][head] > threshold:
-                        print(f"RS_0 | <-", end="")
+    @torch.no_grad()
+    def reset_edges(self, new, p=1.0):
+        for layer in self.layers:
+            layer.data[
+                (torch.rand_like(layer.data) < p)
+                & (layer < 0)
+            ] = new
+        
 
-                    for layer2 in range(self.layers[layer].shape[1]):
-                        for head2 in range(self.model.cfg.n_heads):
-                            if self.layers[layer][head, layer2, head2] > threshold:
-                                print(f"{layer2}.{head2}, ", end="")
-                    print()
-
-                elif self.resid_coeffs[layer][head] > threshold:
-                    print(f"{layer}.{head} <- RS_0")
-        print("\n| ", end="")
-        for layer in range(self.model.cfg.n_layers):
-            for head in range(self.model.cfg.n_heads):
-                if self.post[layer, head] > threshold:
-                    print(f"{layer}.{head}, ", end="")
-        print(f"-> out", end="")
-        print()
-        print()
 
     @torch.no_grad()
     def clamp_params(self):
@@ -204,6 +249,9 @@ class InterpolatedPathPatch(nn.Module):
     def c_out(self):
         return gradthruclamp(self.drop(self.post))
     
+    def c_RS(self):
+        return gradthruclamp(self.drop(self.resid_coeffs))
+    
     def l1(self, l1_coeff = 0.0, l1_coeff_pre=None, l1_coeff_post=None, crab = 0.01, bias = 0):
         l1_coeff_pre = l1_coeff if l1_coeff_pre is None else l1_coeff_pre
         l1_coeff_post = l1_coeff if l1_coeff_post is None else l1_coeff_post
@@ -220,10 +268,123 @@ class InterpolatedPathPatch(nn.Module):
     
     def l0(self):
         return (
-            (self.resid_coeffs > notzero).sum()
+            (self.resid_coeffs > 0).sum()
             + sum(
-                (layer > notzero).sum()
+                (layer > 0).sum()
                 for layer in self.layers
             )
-            + (self.post > notzero).sum()
+            + (self.post > 0).sum()
         )
+    
+    def num_intermediate(self):
+        return (
+            ((self.resid_coeffs > 0) & (self.resid_coeffs < 1)).sum()
+            + ((self.post > 0) & (self.post < 1)).sum()
+            + sum(
+                ((layer > 0) & (layer < 1)).sum()
+                for layer in self.layers
+            )
+        )
+
+
+    def print_connections(self, threshold = 0.5):
+        # for layer in range(self.modelcfg.n_layers):
+        #     print("\nRS -> ", end="")        
+        #     for head in range(self.modelcfg.n_heads):
+        #         if self.resid_coeffs[layer][head] > threshold:
+        #             print(f"{layer}.{head}, ", end="")
+        print(f"\n--------\tthresh={threshold}")
+        print()
+        for layer in range(self.modelcfg.n_layers):
+            for head in range(self.modelcfg.n_heads):
+                if torch.any(self.layers[layer][head] > threshold):
+                    print(f"{layer}.{head} <- ", end="")
+                    if self.resid_coeffs[layer][head] > threshold:
+                        print(f"RS_0 | <-", end="")
+
+                    for layer2 in range(self.layers[layer].shape[1]):
+                        for head2 in range(self.modelcfg.n_heads):
+                            if self.layers[layer][head, layer2, head2] > threshold:
+                                print(f"{layer2}.{head2}, ", end="")
+                    print()
+
+                elif self.resid_coeffs[layer][head] > threshold:
+                    print(f"{layer}.{head} <- RS_0")
+        print("\n| ", end="")
+        for layer in range(self.modelcfg.n_layers):
+            for head in range(self.modelcfg.n_heads):
+                if self.post[layer, head] > threshold:
+                    print(f"{layer}.{head}, ", end="")
+        print(f"-> out", end="")
+        print()
+        print()
+
+    def get_heads(self, threshold = notzero):
+        heads = set()
+        for layer in range(self.modelcfg.n_layers):
+            for head in range(self.modelcfg.n_heads):
+                if torch.any(self.layers[layer][head] > threshold):
+                    heads.add(f"{layer}.{head}")
+                elif self.resid_coeffs[layer][head] > threshold:
+                    heads.add(f"{layer}.{head}")
+            if self.post[layer, head] > threshold:
+                heads.add(f"{layer}.{head}")
+        return heads
+    
+    def print_tp_fp(self, threshold = notzero):
+        heads = self.get_heads(threshold)
+        fp_vs_fn.fp_tp_edges(self)
+        tp, fp = fp_vs_fn.check_list(heads)
+
+
+
+    def get_edges(self, threshold = 0.5):
+        edges = []
+        for layer in range(self.modelcfg.n_layers):
+            for head in range(self.modelcfg.n_heads):
+                if torch.any(self.layers[layer][head] > threshold):
+                    for layer2 in range(self.layers[layer].shape[1]):
+                        for head2 in range(self.modelcfg.n_heads):
+                            if self.layers[layer][head, layer2, head2] > threshold:
+                                edges += [((layer2, head2), (layer, head))]
+                if self.resid_coeffs[layer][head] > threshold:
+                    edges += [("resid", (layer, head))]
+                if self.post[layer, head] > threshold:
+                    edges += [((layer, head), "out")]
+        return edges
+    
+    def save(self, path = None, version = None, i = None):
+        if version is None:
+            version = self.get_latest_version() + 1
+                
+        if path is None:
+            save_dir = f"saved_models/version_{version}"
+            if not os.path.exists(save_dir):
+                os.mkdir(save_dir)
+            path = f"{save_dir}/patcher_{i}.pt"
+        torch.save(self, path)
+
+    @classmethod
+    def get_latest_version(cls):
+        versions = glob.glob("saved_models/version_*")
+        versions = [int(v.split("_")[-1]) for v in versions]
+        if len(versions) == 0:
+            version = -1
+        else:
+            version = max(versions)
+        return version
+        
+    @classmethod
+    def load_by_version(cls, version, model = None):
+        iterations = glob.glob(f"saved_models/version_{version}/patcher_*.pt")
+        iterations = [int(v.split("_")[-1].split(".")[0]) for v in iterations]
+        iteration = max(iterations)
+        return cls.load(f"saved_models/version_{version}/patcher_{iteration}.pt", model)
+    
+    @classmethod
+    def load(cls, path, model=None):
+        m = torch.load(path)
+        if model is not None:
+            m.modelcfg = model.cfg
+        return m
+    
