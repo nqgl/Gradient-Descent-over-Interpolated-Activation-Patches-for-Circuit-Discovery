@@ -6,7 +6,7 @@ $$h \sum\limits_{l=0}^{n - 1} l h = n (n - 1) / 2 * h ^ 2 = 9504$$
 or
 
 $$
-\big{O} \left(
+O\left(
   h \sum\limits_{l=0}^{n - 1} l h 
 \right)
 $$
