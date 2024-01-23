@@ -9,7 +9,7 @@ import einops
 import fp_vs_fn
 import glob
 import os
-
+torch._tensor
 
 def parallelize(btensor, parallelism):
     return einops.repeat(

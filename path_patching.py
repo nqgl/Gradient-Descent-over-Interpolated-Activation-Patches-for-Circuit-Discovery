@@ -41,11 +41,12 @@ def gradthruclamp(x):
 def gradthruclamplist(l):
     return [gradthruclamp(x) for x in l]
 
+from nqgl.mlutils.time_gpu import TimedFunc
 
 
-
-
-
+# from nqgl.mlutils.norepr import MinRepr
+# functoolspartial = partial
+# partial = lambda *args, **kwargs: MinRepr(functoolspartial(*args, **kwargs))
 
 
 
@@ -392,108 +393,6 @@ def get_path_patch_heads_multidest(
 
 #%%
 
-# I expect this to take way too much memory
-# but then we can pair down the graph and then do this method
-
-
-def get_patch_coefficients(model: HookedTransformer):
-    patch_coefficients = [ 
-        torch.ones(
-            model.cfg.n_heads,
-            device=model.cfg.device,
-            requires_grad=True
-        )
-    ] + [
-        torch.rand(
-            (
-                model.cfg.n_heads, 
-                layer, 
-                model.cfg.n_heads
-            ),
-            device=model.cfg.device,
-            requires_grad=True
-        )
-        for layer in range(1, model.cfg.n_layers)
-    ] + [
-        torch.rand(
-            (
-                model.cfg.n_heads, 
-                model.cfg.n_heads
-            ),
-            device=model.cfg.device,
-            requires_grad=True
-        )
-    ]
-    return patch_coefficients
-
-
-def get_per_layer_patch_coefficients(model: HookedTransformer):
-    roots = [ 
-        torch.ones(
-            model.cfg.n_heads,
-            device=model.cfg.device,
-            requires_grad=True
-        )
-    ] + [
-        torch.rand(
-            (
-                1, 
-                layer, 
-                model.cfg.n_heads
-            ),
-            device=model.cfg.device,
-            requires_grad=True
-        )
-        for layer in range(1, model.cfg.n_layers)
-    ] + [
-        torch.rand(
-            (
-                model.cfg.n_heads, 
-                model.cfg.n_heads
-            ),
-            device=model.cfg.device,
-            requires_grad=True
-        )
-    ]
-    patch_coefficients = [roots[0]] + [
-        parallelize(
-            root,
-            model.cfg.n_heads
-        )
-        for root in roots[1:-1]
-    ] + [roots[-1]]
-
-    return patch_coefficients, roots
-
-
-# def clean_dirty_resid_pre(
-#     resid_head_dirty_coeffs : Union[
-#         Float[Tensor, "head_index"],
-#         Float[Tensor, "pos head_index"] # in this this mode you can see which heads need to read from where!
-#     ],
-#     clean_cache: ActivationCache,
-#     dirty_cache: ActivationCache,
-#     parallelism = 1
-# ):
-#     if parallelism == 1:
-#         return clean_cache["resid_pre", 0].lerp(
-#             dirty_cache["resid_pre", 0], 
-#             resid_head_dirty_coeffs.unsqueeze(-1)
-#         )
-#     else:
-#         batch_size = clean_cache["resid_pre", 0].shape[0]
-#         segment_size = batch_size // parallelism
-#         assert batch_size % parallelism == 0
-#         outs = []
-#         for i in range(parallelism):
-#             out = clean_cache["resid_pre", 0].lerp(
-#                 dirty_cache["resid_pre", 0][i * segment_size : (i + 1) * segment_size], 
-#                 resid_head_dirty_coeffs[i].unsqueeze(-1)
-#             )
-#             outs.append(out)
-#         out = torch.cat(outs, dim=0)
-#         return out
-
 def extract_tensor_hook(
     heads_output :Float[Tensor, "batch pos head_index d_head"],
     hook: HookPoint,
@@ -574,39 +473,18 @@ def interpolated_path_patch(
 ) -> Float[Tensor, "layer head"]:
 
     #step 2
-    seq_len = new_cache["z", 0].shape[1]
-    batch_size = new_cache["z", 0].shape[0]
 
 
     patch_coefficients = coeffs.c_layers()
     patched_heads_values = []
-        # orig_cache["z", 0].lerp(
-        #     new_cache["z", 0], patch_coefficients[0].unsqueeze(-1)
-        # )
-    # orig_cache["resid_pre", 0].shape
-    # orig_resid_pre = parallelize(orig_cache["resid_pre", 0], parallelism)
-    # einops.repeat(
-    #     orig_cache["resid_pre", 0],
-    #     "batch ... -> (parallelism batch) ...",
-    #     parallelism=parallelism
-    # )
-    # if parallelism != 1:
-    #     _, orig_cache = model.run_with_cache(
-    #         orig_resid_pre,
-    #         start_at_layer=0
-    #     )
-    # print("orig_resid_pre", orig_cache["resid_pre", 0][0] == orig_resid_pre[1])
-    # print(orig_cache["resid_pre", 0][0] == orig_resid_pre[0 + parallelism])
-    # print(orig_cache["resid_pre", 0][0] == orig_resid_pre[0 + batch_size])
-
-    # print(orig_cache["resid_pre", 0].shape)
-    # print(orig_resid_pre.shape)
     for layer in range(0, model.cfg.n_layers):
         patched_heads_in_layer = []
         # print("\nlayer", layer, end="->")
         for head_i in range(model.cfg.n_heads // parallelism):  
             head = head_i * parallelism
             # print(head, end=", ")
+
+
             if layer != 0:
                 if parallelism == 1:
                     head_coeffs = patch_coefficients[layer][head]
@@ -650,6 +528,11 @@ def interpolated_path_patch(
                     )
                 ]
             )
+            # print(prof.key_averages(group_by_stack_n=5).table(sort_by='self_cuda_time_total', row_limit=5))
+            # print("done cuda time")
+            # print(prof.key_averages(group_by_stack_n=5).table(sort_by='self_cpu_time_total', row_limit=5))
+            # print("done cputime")
+            # print()
         zcat = torch.cat(patched_heads_in_layer, dim=-2)
         patched_heads_values += [zcat]
     last_patch_coeffs = coeffs.c_out()
@@ -670,15 +553,6 @@ def interpolated_path_patch(
         parallelism = 1
     )
 
-    # model.reset_hooks()
-    # model.add_hook(
-    #     lambda name: name.endswith("z") and not f".{layer}." in name,
-    #     hook_fn
-    # )
-    # model.add_hook(
-    #     lambda name: name.endswith("z") and f".{layer}." in name,
-    #     extract_hook_fn
-    # )
     logits = model.run_with_hooks(
         orig_cache["resid_pre", 0],
         start_at_layer=0,
@@ -689,7 +563,6 @@ def interpolated_path_patch(
             )
         ]
     )
-
 
     return patched_heads_values, patch_coefficients, logits
 
@@ -717,17 +590,23 @@ if LOAD:
     version = InterpolatedPathPatch.get_latest_version()
     patcher = InterpolatedPathPatch.load_by_version(version, model)
 else:
-    patcher = InterpolatedPathPatch(model, p_dropin=0.5, p_dropout=0.2)
-optim = torch.optim.Adam(patcher.parameters(), lr=0.1, betas=(0.9, 0.98))
-optim = torch.optim.SGD(patcher.parameters(), lr = 0.25, momentum=0.8, nesterov=True)
-N = 8
+    patcher = InterpolatedPathPatch(model, p_dropin=0.25, p_dropout=0.05)
+optim = torch.optim.SGD(patcher.parameters(), lr = 0.001, momentum=0.8, nesterov=True)
+# optim = torch.optim.Adam(patcher.parameters(), lr=0.001, betas=(0.9, 0.99))
+N = 12
 l0_history = [1.]
-for i in range(10000):
+import tqdm
+# interpolated_path_patch = TimedFunc(interpolated_path_patch, print_on_call=True)
+for i in tqdm.tqdm(range(10000)):
     print("step ", i)
     optim.zero_grad()
     print("getting data")
     ioi_cache, abc_cache, ioi_metric, kl_metric = get_next_data(N)
     print("getting path patch")
+    # with torch.autograd.profiler.profile(
+        # with_stack=True, with_modules=True, profile_memory=True) as prof:
+
+
     values, coefficients, logits = interpolated_path_patch(
         model, 
         coeffs=patcher,
@@ -735,34 +614,34 @@ for i in range(10000):
         orig_cache=ioi_cache,
         parallelism=12,
     )
-    print("done")
+    # prof.export_chrome_trace(f"./traces/traceall{i}.json")
     # patch_coefficients = patcher.tolist()
 
     kl_div = kl_metric(logits)
-    loss_l1 = patcher.l1(0.001, 0.001, 0.001, crab = 0.) * 3
+    loss_l1 = patcher.l1(0.001, 0.001, 0.001, crab = 0.) * 2.5
     loss_logits = ioi_metric(logits)
     l0 = patcher.l0().item()
     l0_history.append(l0)
-    loss = kl_div * 0.02 + loss_logits
-    # loss = loss_logits
+    # loss = kl_div * 0.02 + loss_logits
+    loss = loss_logits
     loss = loss + loss_l1 * (1 + min(l0_history[-6:]) / max(15000 - i * 500, 200)) # if i > 20 else loss_logits + loss_l1
+    if i % 100 < 10 or i % 10 == 0:
+        if l0 < 400:
+            patcher.print_connections(threshold=0)
+            patcher.print_connections()
+        
 
-    if l0 < 400:
-        patcher.print_connections(threshold=0)
-        patcher.print_connections()
-    
-
-    print("\nlogit diff:", loss_logits.item())
-    print("kl_score", kl_div.item())
-    print("L1:", loss_l1.item())
-    print("nonzero coeffs:", l0)
-    print("intermeidate values:", patcher.num_intermediate())
+        print("\nlogit diff:", loss_logits.item())
+        print("kl_score", kl_div.item())
+        print("L1:", loss_l1.item())
+        print("nonzero coeffs:", l0)
+        print("intermeidate values:", patcher.num_intermediate())
     loss.backward()
     optim.step()
     patcher.print_tp_fp(threshold=0.5)
-    if i < 2000 and i % 10 == 0:
+    if i < 2000 and i % 100 == 0:
         patcher.clamp_params(0.01)
-    if i < 2000 and i % 50 == 5:
+    if i < 2000 and i % 200 == 5:
         patcher.clamp_params(0.01)
         patcher.reset_RS_coeffs(0.9, p=0.5, out=True)
         patcher.reset_edges(0.1, p=0.25)
