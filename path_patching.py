@@ -10,11 +10,9 @@ from ioi_dataset import IOIDataset
 from transformer_lens.hook_points import HookPoint
 from transformer_lens import utils, HookedTransformer, ActivationCache
 from transformer_lens.components import Embed, Unembed, LayerNorm, MLP
-# from arena_utils.plotly_utils import imshow, line, scatter, bar
 from functools import partial
 import einops
 import torch.nn.functional as F
-# device = t.device("cuda") if t.cuda.is_available() else t.device("cpu")
 
 # %%
 from parameters import InterpolatedPathPatch, parallelize, mylerp
@@ -44,354 +42,11 @@ def gradthruclamplist(l):
 from nqgl.mlutils.time_gpu import TimedFunc
 
 
-# from nqgl.mlutils.norepr import MinRepr
-# functoolspartial = partial
-# partial = lambda *args, **kwargs: MinRepr(functoolspartial(*args, **kwargs))
+from nqgl.mlutils.norepr import fastpartial as partial
 
 
 
 
-
-def head_path_patch_hook(
-    heads_output :Float[Tensor, "batch pos head_index d_head"],
-    hook: HookPoint,
-    clean_cache: ActivationCache,
-    corrupted_activations :Dict[Tuple, Float[Tensor, "batch pos d_head"]],
-    ignore_positions : Optional[Bool[Tensor, "layer pos head"]] = None,
-) -> Float[Tensor, "batch pos head_index d_head"]:
-    # print("called hook", hook.name, hook.layer())
-    # replace with clean cache everywhere that's not ignore
-    heads_output[:, ~ignore_positions[hook.layer()], :] = (
-        clean_cache[hook.name][:, ~ignore_positions[hook.layer()], :]
-    )
-    for loc, act in corrupted_activations.items():
-        layer, head = loc
-        # print("searching for", loc)
-        if layer == hook.layer():
-            # print("corrupted", loc)
-            heads_output[:, :, head, :] = act
-    # then replace with locations in corrupted activations
-    
-    return heads_output
-
-def get_path_patch_heads(
-    model: HookedTransformer,
-    patching_metric: Callable,
-    paths : Tuple[Tuple[int, int], Tuple[int, int]],
-    new_cache: Optional[ActivationCache] ,
-    orig_cache: Optional[ActivationCache] ,
-    
-) -> Float[Tensor, "layer head"]:
-
-    #step 2
-    unique_dest_nodes = set([path_dest for path_src, path_dest in paths])
-    unique_dest_nodes = {
-        path_dest : [
-            path_src for path_src, path_dest2 in paths if path_dest2 == path_dest
-        ]
-        for path_dest in unique_dest_nodes
-    }
-    seq_len = new_cache["z", 0].shape[1]
-    corrupted_dests = {}
-    for path_dest in unique_dest_nodes:
-        path_srcs = unique_dest_nodes[path_dest]
-        path_dest_layer, path_dest_head = path_dest
-        corrupted_srcs = {
-            path_src : 
-            new_cache["z", path_src[0]][..., path_src[1], :]
-            for path_src in path_srcs
-        }
-
-        ignore = torch.zeros((model.cfg.n_layers, seq_len,  model.cfg.n_heads), dtype=torch.bool, device=model.cfg.device)
-        ignore[path_dest[0], :, path_dest[1]] = True
-
-        patch_function_step_2 = partial(
-            head_path_patch_hook,
-            clean_cache=orig_cache,
-            corrupted_activations = corrupted_srcs,
-            ignore_positions = ignore,
-            #call on ALL layers prior to dest layer
-        )
-        min_path_src_layer = min([path_src[0] for path_src in path_srcs])
-        model.reset_hooks(including_permanent=True)
-        model.add_hook(lambda name: name.endswith("z"), patch_function_step_2)
-            # fwd_hooks=[
-            #     (utils.get_act_name("z", layer), patch_function_step_2)
-            #     for layer in range(min_path_src_layer, path_dest[0])
-            # ]
-        
-        useless_logits, corrupted_path_cache = model.run_with_cache(
-            orig_cache["resid_pre", 0],
-            start_at_layer=0
-        )
-        corrupted_dests[path_dest] = (
-            corrupted_path_cache["z", path_dest_layer][..., path_dest_head, :]
-        )
-        assert not (corrupted_path_cache["z", path_dest_layer][..., path_dest_head, :] == orig_cache["z", path_dest_layer][..., path_dest_head, :]).all()
-    #step 3
-    ignore = torch.zeros((model.cfg.n_layers, seq_len,  model.cfg.n_heads), dtype=torch.bool, device=model.cfg.device)
-    # print(corrupted_dests.keys())
-    for path_dest in corrupted_dests.keys():
-        ignore[path_dest[0], :, path_dest[1]] = True
-    patch_function = partial(
-        head_path_patch_hook, 
-        clean_cache=orig_cache,
-        corrupted_activations= corrupted_dests,
-        ignore_positions=ignore,
-    )
-    min_path_dest = min([path_dest[0] for path_dest in unique_dest_nodes])
-    model.reset_hooks(including_permanent=True)
-    # model.add_hook
-    useful_logits = model.run_with_hooks(
-        orig_cache["resid_pre", 0],
-        start_at_layer=0,
-        fwd_hooks=[
-            (utils.get_act_name("z", layer), patch_function)
-            for layer in range(min_path_dest, model.cfg.n_layers)
-        ]
-    )
-    return useful_logits
-
-# results = torch.zeros(12,12, device = model.cfg.device, dtype=torch.float32)
-# for layer in range(10):
-#     for head in range(12):
-#         torch.cuda.empty_cache()
-#         result = ioi_metric(get_path_patch_heads(model, ioi_metric, [((layer, head), (10, 7))])).detach()
-#         print(f"{layer}.{head}:", result)
-#         results[layer, head] = result
-
-# imshow(
-#     results * 100,
-#     title="Direct effect on logit difference",
-#     labels={"x":"Head", "y":"Layer", "color": "Logit diff. variation"},
-#     coloraxis=dict(colorbar_ticksuffix = "%"),
-#     width=600,
-# )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#%%
-# SECOND ITERATION WHICH IS ONE TO MANY
-
-
-[{},{},{},{},{3:None, 4:None}]
-
-def head_path_patch_hook2(
-    heads_output :Float[Tensor, "batch pos head_index d_head"],
-    hook: HookPoint,
-    clean_cache: ActivationCache,
-    corrupted_activations :Dict[Tuple, Float[Tensor, "batch pos d_head"]],
-    save_list : List[Dict[int, Optional[Tensor]]],
-    ignore_positions : Optional[Bool[Tensor, "layer pos head"]] = None,
-) -> Float[Tensor, "batch pos head_index d_head"]:
-    # print("called hook", hook.name, hook.layer())
-    # replace with clean cache everywhere that's not ignore
-    for head in save_list[hook.layer()]:
-        # print(save_list[hook.layer()])
-        if save_list[hook.layer()][head] is None:
-            save_list[hook.layer()][head] = heads_output[:, :, head, :].clone()
-        else:
-            raise ValueError("head already saved")
-
-
-    heads_output[:, ~ignore_positions[hook.layer()], :] = (
-        clean_cache[hook.name][:, ~ignore_positions[hook.layer()], :]
-    )
-    for loc, act in corrupted_activations.items():
-        layer, head = loc
-        # print("searching for", loc)
-        if layer == hook.layer():
-            # print("corrupted2", loc)
-            heads_output[:, :, head, :] = act
-    # then replace with locations in corrupted activations
-    
-    return heads_output
-
-def get_path_patch_heads_multidest(
-    model: HookedTransformer,
-    patching_metric: Callable,
-    src_nodes : List[Tuple[int, int]],
-    dest_nodes : List[Tuple[int, int]],
-    new_cache: Optional[ActivationCache] ,
-    orig_cache: Optional[ActivationCache],
-) -> Float[Tensor, "layer head"]:
-
-    #step 2
-    seq_len = new_cache["z", 0].shape[1]
-    corrupted_dests = {}
-    save_list = [
-        {
-            head : None
-            for head in range(model.cfg.n_heads)
-            if (layer, head) in dest_nodes
-        }
-        for layer in range(model.cfg.n_layers)
-    ]
-    corrupted_srcs = {
-        path_src : 
-        new_cache["z", path_src[0]][..., path_src[1], :]
-        for path_src in src_nodes
-    }
-
-    ignore = torch.zeros((model.cfg.n_layers, seq_len,  model.cfg.n_heads), dtype=torch.bool, device=model.cfg.device)
-    patch_function_step_2 = partial(
-        head_path_patch_hook2,
-        clean_cache=orig_cache,
-        corrupted_activations = corrupted_srcs,
-        ignore_positions = ignore,
-        save_list = save_list,
-    )
-    # min_path_src_layer = min([path_src[0] for path_src in src_nodes])
-    model.reset_hooks()
-    model.add_hook(lambda name: name.endswith("z"), patch_function_step_2)
-    useless_logits, corrupted_path_cache = model.run_with_cache(
-        orig_cache["resid_pre", 0],
-        start_at_layer=0
-    )
-    for i in range(model.cfg.n_layers):
-        for head in save_list[i]:
-            if save_list[i][head] is not None:
-                corrupted_dests[(i, head)] = save_list[i][head]
-    #step 3
-    ignore = torch.ones((model.cfg.n_layers, seq_len,  model.cfg.n_heads), dtype=torch.bool, device=model.cfg.device)
-    patch_function = partial(
-        head_path_patch_hook, 
-        clean_cache=orig_cache,
-        corrupted_activations= corrupted_dests,
-        ignore_positions=ignore,
-    )
-    min_path_dest = min([path_dest[0] for path_dest in dest_nodes])
-    model.reset_hooks()
-    # model.add_hook
-    useful_logits = model.run_with_hooks(
-        orig_cache["resid_pre", 0],
-        start_at_layer=0,
-        fwd_hooks=[
-            (utils.get_act_name("z", layer), patch_function)
-            for layer in range(min_path_dest, model.cfg.n_layers)
-        ]
-    )
-    return useful_logits
-
-
-#%%
-
-
-
-
-def head_path_patch_hook2(
-    heads_output :Float[Tensor, "batch pos head_index d_head"],
-    hook: HookPoint,
-    clean_cache: ActivationCache,
-    corrupted_activations :Dict[Tuple, Float[Tensor, "batch pos d_head"]],
-    save_list : List[Dict[int, Optional[Tensor]]],
-    ignore_positions : Optional[Bool[Tensor, "layer pos head"]] = None,
-) -> Float[Tensor, "batch pos head_index d_head"]:
-    # print("called hook", hook.name, hook.layer())
-    # replace with clean cache everywhere that's not ignore
-    for head in save_list[hook.layer()]:
-        # print(save_list[hook.layer()])
-        if save_list[hook.layer()][head] is None:
-            save_list[hook.layer()][head] = heads_output[:, :, head, :].clone()
-        else:
-            raise ValueError("head already saved")
-
-
-    heads_output[:, ~ignore_positions[hook.layer()], :] = (
-        clean_cache[hook.name][:, ~ignore_positions[hook.layer()], :]
-    )
-    for loc, act in corrupted_activations.items():
-        layer, head = loc
-        # print("searching for", loc)
-        if layer == hook.layer():
-            # print("corrupted2", loc)
-            heads_output[:, :, head, :] = act
-    # then replace with locations in corrupted activations
-    
-    return heads_output
-
-def get_path_patch_heads_multidest(
-    model: HookedTransformer,
-    patching_metric: Callable,
-    src_nodes : List[Tuple[int, int]],
-    dest_nodes : List[Tuple[int, int]],
-    new_cache: Optional[ActivationCache],
-    orig_cache: Optional[ActivationCache]
-    ) -> Float[Tensor, "layer head"]:
-
-    #step 2
-    seq_len = new_cache["z", 0].shape[1]
-    corrupted_dests = {}
-    save_list = [
-        {
-            head : None
-            for head in range(model.cfg.n_heads)
-            if (layer, head) in dest_nodes
-        }
-        for layer in range(model.cfg.n_layers)
-    ]
-    corrupted_srcs = {
-        path_src : 
-        new_cache["z", path_src[0]][..., path_src[1], :]
-        for path_src in src_nodes
-    }
-
-    ignore = torch.zeros((model.cfg.n_layers, seq_len,  model.cfg.n_heads), dtype=torch.bool, device=model.cfg.device)
-    patch_function_step_2 = partial(
-        head_path_patch_hook2,
-        clean_cache=orig_cache,
-        corrupted_activations = corrupted_srcs,
-        ignore_positions = ignore,
-        save_list = save_list,
-    )
-    # min_path_src_layer = min([path_src[0] for path_src in src_nodes])
-    model.reset_hooks()
-    model.add_hook(lambda name: name.endswith("z"), patch_function_step_2)
-    useless_logits, corrupted_path_cache = model.run_with_cache(
-        orig_cache["resid_pre", 0],
-        start_at_layer=0
-    )
-    for i in range(model.cfg.n_layers):
-        for head in save_list[i]:
-            if save_list[i][head] is not None:
-                corrupted_dests[(i, head)] = save_list[i][head]
-    #step 3
-    ignore = torch.ones((model.cfg.n_layers, seq_len,  model.cfg.n_heads), dtype=torch.bool, device=model.cfg.device)
-    patch_function = partial(
-        head_path_patch_hook, 
-        clean_cache=orig_cache,
-        corrupted_activations= corrupted_dests,
-        ignore_positions=ignore,
-    )
-    min_path_dest = min([path_dest[0] for path_dest in dest_nodes])
-    model.reset_hooks()
-    # model.add_hook
-    useful_logits = model.run_with_hooks(
-        orig_cache["resid_pre", 0],
-        start_at_layer=0,
-        fwd_hooks=[
-            (utils.get_act_name("z", layer), patch_function)
-            for layer in range(min_path_dest, model.cfg.n_layers)
-        ]
-    )
-    return useful_logits
-
-
-
-
-#%%
 
 def extract_tensor_hook(
     heads_output :Float[Tensor, "batch pos head_index d_head"],
@@ -590,7 +245,7 @@ if LOAD:
     version = InterpolatedPathPatch.get_latest_version()
     patcher = InterpolatedPathPatch.load_by_version(version, model)
 else:
-    patcher = InterpolatedPathPatch(model, p_dropin=0.25, p_dropout=0.05)
+    patcher = InterpolatedPathPatch(model, p_dropin=0.2, p_dropout=0.05)
 optim = torch.optim.SGD(patcher.parameters(), lr = 0.001, momentum=0.8, nesterov=True)
 # optim = torch.optim.Adam(patcher.parameters(), lr=0.001, betas=(0.9, 0.99))
 N = 12
@@ -598,7 +253,7 @@ l0_history = [1.]
 import tqdm
 # interpolated_path_patch = TimedFunc(interpolated_path_patch, print_on_call=True)
 for i in tqdm.tqdm(range(10000)):
-    print("step ", i)
+    print("\n\nstep ", i)
     optim.zero_grad()
     print("getting data")
     ioi_cache, abc_cache, ioi_metric, kl_metric = get_next_data(N)
@@ -632,10 +287,10 @@ for i in tqdm.tqdm(range(10000)):
         
 
         print("\nlogit diff:", loss_logits.item())
-        print("kl_score", kl_div.item())
-        print("L1:", loss_l1.item())
         print("nonzero coeffs:", l0)
         print("intermeidate values:", patcher.num_intermediate())
+    print("kl_score", kl_div.item())
+    print("L1:", loss_l1.item())
     loss.backward()
     optim.step()
     patcher.print_tp_fp(threshold=0.5)
