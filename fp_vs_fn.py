@@ -282,7 +282,7 @@ def fp_tp_edges(patcher, circuit = ioi_circuit, threshold = 0.5):
     ioi_edges = edges(circuit)
     p_edges = set(p_edges)
     if len(p_edges) < 150:
-        print(f"Difference: {p_edges.difference(ioi_edges)}")
+        print(f"Difference: {p_edges - ioi_edges}")
         print(f"Intersection: {p_edges.intersection(ioi_edges)}")
     print(f"p_edges: {len(p_edges)}")
     print(f"ioi_edges: {len(ioi_edges)}")
@@ -296,12 +296,12 @@ if __name__ == "__main__":
         parameters.InterpolatedPathPatch.get_latest_version(), model
     )
     tp, fp = check_list(patcher.get_heads(threshold=0))
-    fp_tp_edges(patcher)
     print(f"fp: {fp}")
     heads = patcher.get_heads()
-    
     found_circuit = Circuit()
     p_edges = patcher.get_edges(threshold=0)
+    fp_tp_edges(patcher, threshold=0.2)
+
     found_circuit.add(set(p_edges))
     found_circuit.inspect_node((9, 9))
     found_circuit.inspect_node((1, 7))

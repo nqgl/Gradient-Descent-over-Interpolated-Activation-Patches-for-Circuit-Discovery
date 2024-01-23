@@ -717,9 +717,11 @@ if LOAD:
     version = InterpolatedPathPatch.get_latest_version()
     patcher = InterpolatedPathPatch.load_by_version(version, model)
 else:
-    patcher = InterpolatedPathPatch(model)
-optim = torch.optim.Adam(patcher.parameters(), lr=1, betas=(0.9, 0.98))
-N = 1
+    patcher = InterpolatedPathPatch(model, p_dropin=0.5, p_dropout=0.2)
+optim = torch.optim.Adam(patcher.parameters(), lr=0.1, betas=(0.9, 0.98))
+optim = torch.optim.SGD(patcher.parameters(), lr = 0.25, momentum=0.8, nesterov=True)
+N = 8
+l0_history = [1.]
 for i in range(10000):
     print("step ", i)
     optim.zero_grad()
@@ -737,30 +739,31 @@ for i in range(10000):
     # patch_coefficients = patcher.tolist()
 
     kl_div = kl_metric(logits)
-    loss_l1 = patcher.l1(0.1, 0.04, 0.05) / 6
+    loss_l1 = patcher.l1(0.001, 0.001, 0.001, crab = 0.) * 3
     loss_logits = ioi_metric(logits)
-    l0 = patcher.l0().detach()
+    l0 = patcher.l0().item()
+    l0_history.append(l0)
     loss = kl_div * 0.02 + loss_logits
-    loss = loss_logits
-    loss = loss + loss_l1 * (1 + l0 / max(10000 - i * 500, 200)) # if i > 20 else loss_logits + loss_l1
+    # loss = loss_logits
+    loss = loss + loss_l1 * (1 + min(l0_history[-6:]) / max(15000 - i * 500, 200)) # if i > 20 else loss_logits + loss_l1
 
     if l0 < 400:
         patcher.print_connections(threshold=0)
         patcher.print_connections()
     
 
-    loss.backward()
-    optim.step()
-    patcher.print_tp_fp()
     print("\nlogit diff:", loss_logits.item())
     print("kl_score", kl_div.item())
     print("L1:", loss_l1.item())
     print("nonzero coeffs:", l0)
     print("intermeidate values:", patcher.num_intermediate())
-    if i < 2000 and i % 100 == 0:
-        patcher.clamp_params()
-    if i < 2000 and i % 100 == 50:
-        patcher.clamp_params()
+    loss.backward()
+    optim.step()
+    patcher.print_tp_fp(threshold=0.5)
+    if i < 2000 and i % 10 == 0:
+        patcher.clamp_params(0.01)
+    if i < 2000 and i % 50 == 5:
+        patcher.clamp_params(0.01)
         patcher.reset_RS_coeffs(0.9, p=0.5, out=True)
         patcher.reset_edges(0.1, p=0.25)
     # if i == 10:

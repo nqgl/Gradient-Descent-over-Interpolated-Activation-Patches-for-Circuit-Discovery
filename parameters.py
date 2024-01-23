@@ -50,21 +50,40 @@ class DropIn(torch.autograd.Function):
         return grad_output, None, None
         mask, = ctx.saved_tensors
         return grad_output * mask, None, None
-    
-class DropInRand(torch.autograd.Function):
+
+class dropInRand(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, p):
-        mask = torch.rand_like(x) > p
-        v = torch.rand_like(x)
-        ctx.save_for_backward(mask)
-        return x * mask + v * (~mask)
+    def forward(ctx, x, p, v=1., max_mag = 1.0, mag_prob_adj = 0.0):
+        rand = torch.rand_like(x)
+        mask = (
+            (rand + x * mag_prob_adj < p) 
+            & (x < max_mag if max_mag is not None else True)
+        )
+        v = torch.rand_like(x) * v
+        # ctx.save_for_backward(mask)
+        return x * (~mask) + v * (mask)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, None, None
+        return grad_output, None, None, None, None
+        # grad at a different value still provides some evidence
+            #for what your value should be so I'm keeping these gradients
+            # this also allows the use of normal relu without the dying coefficients problem
+            # which seems good
         mask, = ctx.saved_tensors
         return grad_output * mask, None, None
 
+class DropInRand(nn.Module):
+    def __init__(self, p, v=1., max_mag = 1.0, mag_prob_adj = 0.0):
+        super().__init__()
+        self.p=p
+        self.v=v
+        self.max_mag=max_mag
+        self.mag_prob_adj=mag_prob_adj
+
+    
+    def forward(self, x):
+        return dropInRand.apply(x, self.p, self.v, self.max_mag, self.mag_prob_adj)
 
 class GradThruRelu(torch.autograd.Function):
     @staticmethod
@@ -74,11 +93,11 @@ class GradThruRelu(torch.autograd.Function):
     def backward(ctx, grad_output):
         return grad_output
 
-
+from functools import partial
 gradthrurelu = GradThruRelu.apply
-
-def gradthrurelu(x):
-    return x - (x - F.relu(x)).detach()
+gradthrurelu = F.relu
+# def gradthrurelu(x, relu=udrelu):
+#     return x - (x - relu(x)).detach()
 
 
 notzero = 0
@@ -115,8 +134,8 @@ class InterpolatedPathPatch(nn.Module):
         self, 
         model, 
         resid_coeff_seq :Optional[int] = None,
-        p_dropin = 0.15,
-        p_dropout = 0.06,
+        p_dropin = 0.2,
+        p_dropout = 0.04,
     ) -> None:
         super().__init__()
         rescale = 0.75
@@ -169,12 +188,17 @@ class InterpolatedPathPatch(nn.Module):
                 requires_grad=True
             )
         )
-        self.dropout = nn.Dropout(0.04)
-        self.dropin_params = (p_dropin, 0.5)
+        self.dropout = nn.Dropout(p_dropout)
+        self.dropin = DropInRand(
+            p_dropin,
+            v=0.5,
+            max_mag=0.5,
+            mag_prob_adj=0.0
+        )
 
 
     def drop(self, x):
-        return self.dropout(DropIn.apply(x, *self.dropin_params)) * (1 - self.dropout.p) 
+        return self.dropout(self.dropin(x)) * (1 - self.dropout.p) 
 
     def interpolate_resid_pres(
         self, 
@@ -186,7 +210,7 @@ class InterpolatedPathPatch(nn.Module):
     ) -> Float[Tensor, "parallelism*batch pos d_model"]:
         batch_size = rsp_clean.shape[0]
         coefficients = self.c_RS()[layer] if layer is not None else self.c_RS()
-        coefficients = gradthruclamp(self.drop(coefficients))
+        # coefficients = gradthruclamp(self.drop(coefficients))
         # print(start_head, parallelism, rsp_clean.shape, rsp_dirty.shape, coefficients.shape)
         if start_head is not None:
             sl = slice(start_head, parallelism + start_head)
@@ -226,11 +250,11 @@ class InterpolatedPathPatch(nn.Module):
 
 
     @torch.no_grad()
-    def clamp_params(self):
-        self.resid_coeffs.data.clamp_(0, 1)
+    def clamp_params(self, margin = 0.0):
+        self.resid_coeffs.data.clamp_(0 + margin, 1 - margin)
         for layer in self.layers:
-            layer.data.clamp_(0, 1)
-        self.post.data.clamp_(0, 1)
+            layer.data.clamp_(0 + margin, 1 - margin)
+        self.post.data.clamp_(0 + margin, 1 - margin)
 
     def clamplist(self):
         return gradthruclamplist(self.tolist())
@@ -256,6 +280,9 @@ class InterpolatedPathPatch(nn.Module):
         l1_coeff_pre = l1_coeff if l1_coeff_pre is None else l1_coeff_pre
         l1_coeff_post = l1_coeff if l1_coeff_post is None else l1_coeff_post
         def crabs(x):
+            """
+            crab = 0 makes this behave like a relu
+            """
             return torch.relu((x + bias) * (1 + crab)) - (x + bias).abs() * crab
         return (
             l1_coeff_pre * crabs(self.resid_coeffs).sum()

@@ -178,17 +178,6 @@ def get_path_patch_heads(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
 #%%
 # SECOND ITERATION WHICH IS ONE TO MANY
 
@@ -223,8 +212,9 @@ def head_path_patch_hook2(
             # print("corrupted2", loc)
             heads_output[:, :, head, :] = act
     # then replace with locations in corrupted activations
-    
     return heads_output
+
+
 
 def get_path_patch_heads_multidest(
     model: HookedTransformer,
