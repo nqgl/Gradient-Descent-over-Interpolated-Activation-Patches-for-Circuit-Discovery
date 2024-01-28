@@ -8,7 +8,7 @@ import torch
 t = torch
 import re
 device = t.device("cuda") if t.cuda.is_available() else t.device("cpu")
-
+import torch.nn.functional as F
 model = HookedTransformer.from_pretrained(
     "gpt2-small",
     center_unembed=True,
@@ -86,8 +86,9 @@ def get_next_data(N=1, model=model, seed=None):
             # Find KL divergence
             return torch.nn.functional.kl_div(
                 torch.nn.functional.log_softmax(end_logits, dim=-1),
-                torch.nn.functional.softmax(abc_logits, dim=-1),
-                reduction="batchmean"
+                torch.nn.functional.log_softmax(abc_logits, dim=-1),
+                reduction="batchmean",
+                log_target=True
             )
 
         def logits_to_ave_logit_diff_2(
@@ -100,7 +101,7 @@ def get_next_data(N=1, model=model, seed=None):
 
             If per_prompt=True, return the array of differences rather than the average.
             '''
-
+            logits = F.log_softmax(logits, dim=-1)
             # Only the final logits are relevant for the answer
             # Get the logits corresponding to the indirect object / subject tokens respectively
             io_logits = logits[range(logits.size(0)), ioi_dataset.word_idx["end"], ioi_dataset.io_tokenIDs] # [batch]

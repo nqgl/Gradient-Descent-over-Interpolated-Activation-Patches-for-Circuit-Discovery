@@ -9,7 +9,8 @@ import einops
 import fp_vs_fn
 import glob
 import os
-torch._tensor
+
+from dropin import DropInRand
 
 def parallelize(btensor, parallelism):
     return einops.repeat(
@@ -26,9 +27,10 @@ def batchify(ptensor, batch_size):
     )
 
 def mylerp(a, b, w):
-    out = a + (b - a) * w
-    assert out.shape == a.shape == b.shape
-    return out
+    return torch.lerp(a, b, w)
+    # out = a + (b - a) * w
+    # assert out.shape == a.shape == b.shape
+    # return out
 
 
 class GradThruRelu(torch.autograd.Function):
@@ -38,52 +40,6 @@ class GradThruRelu(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         return grad_output
-
-class DropIn(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, p, v):
-        mask = torch.rand_like(x) > p
-        ctx.save_for_backward(mask)
-        return x * mask + v * (~mask)
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output, None, None
-        mask, = ctx.saved_tensors
-        return grad_output * mask, None, None
-
-class dropInRand(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, p, v=1., max_mag = 1.0, mag_prob_adj = 0.0):
-        rand = torch.rand_like(x)
-        mask = (
-            (rand + x * mag_prob_adj < p) 
-            & (x < max_mag if max_mag is not None else True)
-        )
-        v = torch.rand_like(x) * v
-        # ctx.save_for_backward(mask)
-        return x * (~mask) + v * (mask)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output, None, None, None, None
-        # grad at a different value still provides some evidence
-            #for what your value should be so I'm keeping these gradients
-            # this also allows the use of normal relu without the dying coefficients problem
-            # which seems good
-        mask, = ctx.saved_tensors
-        return grad_output * mask, None, None
-
-class DropInRand(nn.Module):
-    def __init__(self, p, v=1., max_mag = 1.0, mag_prob_adj = 0.0):
-        super().__init__()
-        self.p=p
-        self.v=v
-        self.max_mag=max_mag
-        self.mag_prob_adj=mag_prob_adj
-
-    
-    def forward(self, x):
-        return dropInRand.apply(x, self.p, self.v, self.max_mag, self.mag_prob_adj)
 
 class GradThruRelu(torch.autograd.Function):
     @staticmethod
@@ -95,17 +51,26 @@ class GradThruRelu(torch.autograd.Function):
 
 from functools import partial
 gradthrurelu = GradThruRelu.apply
-gradthrurelu = F.relu
-# def gradthrurelu(x, relu=udrelu):
-#     return x - (x - relu(x)).detach()
+# gradthrurelu = F.relu
+
+def make_BinaryThresholdClamp(threshold):
+    class BTClamp(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            return torch.where(x > threshold, torch.ones_like(x), torch.zeros_like(x))
+        @staticmethod
+        def backward(ctx, grad_output):
+            return grad_output
+    return BTClamp.apply
+btclamp = make_BinaryThresholdClamp(0.5)
+
 
 
 notzero = 0
 def gradthruclamp(x, notzero=notzero):
     x = 1 - gradthrurelu(1 - gradthrurelu(x) - notzero * 2) - notzero
+    # return torch.clamp(x, notzero, 1 - notzero)
     return x
-    return NormGrad.apply(btclamp(x))
-    # return F.sigmoid(x)
 
 
 
@@ -165,17 +130,17 @@ class InterpolatedPathPatch(nn.Module):
             ]
         )
         self.post = nn.Parameter(
-            torch.ones(
+            torch.rand(
                 (
                     self.modelcfg.n_heads,
                     self.modelcfg.n_heads
                 ),
                 device=self.modelcfg.device,
                 requires_grad=True
-            ) 
+            ) * rescale + bias
         )
         self.resid_coeffs = nn.Parameter(
-            torch.ones(
+            torch.rand(
                 (
                     self.modelcfg.n_layers,
                     self.modelcfg.n_heads
@@ -186,7 +151,7 @@ class InterpolatedPathPatch(nn.Module):
                 ),
                 device=self.modelcfg.device,
                 requires_grad=True
-            )
+            ) * rescale + bias
         )
         self.dropout = nn.Dropout(p_dropout)
         self.dropin = DropInRand(
@@ -209,7 +174,7 @@ class InterpolatedPathPatch(nn.Module):
         start_head :Optional[int] = None
     ) -> Float[Tensor, "parallelism*batch pos d_model"]:
         batch_size = rsp_clean.shape[0]
-        coefficients = self.c_RS()[layer] if layer is not None else self.c_RS()
+        coefficients = self.c_RS(layer) if layer is not None else self.c_RS()
         # coefficients = gradthruclamp(self.drop(coefficients))
         # print(start_head, parallelism, rsp_clean.shape, rsp_dirty.shape, coefficients.shape)
         if start_head is not None:
@@ -271,11 +236,14 @@ class InterpolatedPathPatch(nn.Module):
         return gradthruclamplist([self.drop(layer) for layer in self.layers])
     
     def c_out(self):
-        return gradthruclamp(self.drop(self.post))
+        return gradthruclamp(self.dropin(self.post))
+        # return gradthruclamp(self.drop(self.post))
     
-    def c_RS(self):
-        return gradthruclamp(self.drop(self.resid_coeffs))
-    
+    def c_RS(self, layer=None):
+        if layer is None:
+            return self.drop(gradthruclamp(self.resid_coeffs))
+        else:
+            return self.drop(gradthruclamp(self.resid_coeffs[layer]))
     def l1(self, l1_coeff = 0.0, l1_coeff_pre=None, l1_coeff_post=None, crab = 0.01, bias = 0):
         l1_coeff_pre = l1_coeff if l1_coeff_pre is None else l1_coeff_pre
         l1_coeff_post = l1_coeff if l1_coeff_post is None else l1_coeff_post
@@ -293,16 +261,30 @@ class InterpolatedPathPatch(nn.Module):
             + l1_coeff_post * crabs(self.post).sum()
         )
     
-    def l0(self):
+    def l0(self, threshold = 0):
         return (
-            (self.resid_coeffs > 0).sum()
+            (self.resid_coeffs > threshold).sum()
             + sum(
-                (layer > 0).sum()
+                (layer > threshold).sum()
                 for layer in self.layers
             )
-            + (self.post > 0).sum()
+            + (self.post > threshold).sum()
         )
     
+    def l_one_half(self, coeff = 0.001, coeff_pre=None, coeff_post=None, eps = 0.1):
+        coeff_pre = coeff if coeff_pre is None else coeff_pre
+        coeff_post = coeff if coeff_post is None else coeff_post
+
+        return (
+            coeff_pre * (gradthruclamp(self.resid_coeffs) + eps).pow(0.5).sum()
+            + sum(
+                coeff * (gradthruclamp(layer) + eps).pow(0.5).sum()
+                for layer in self.layers
+            )
+            + coeff_post * (gradthruclamp(self.post) + eps).pow(0.5).sum()
+        )
+
+
     def num_intermediate(self):
         return (
             ((self.resid_coeffs > 0) & (self.resid_coeffs < 1)).sum()
